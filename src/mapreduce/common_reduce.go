@@ -1,5 +1,19 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"io/ioutil"
+	"log"
+	"os"
+	"sort"
+)
+
+type byKey []KeyValue
+
+func (a byKey) Len() int           { return len(a) }
+func (a byKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +58,46 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+	m := make(map[string][]string)
+
+	for mi := 0; mi < nMap; mi++ {
+		inFile := reduceName(jobName, mi, reduceTask)
+		data, err := ioutil.ReadFile(inFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		var kvps []KeyValue
+		err = json.Unmarshal(data, &kvps)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, kvp := range kvps {
+			m[kvp.Key] = append(m[kvp.Key], kvp.Value)
+		}
+	}
+
+	var arrReduced []KeyValue
+	for key, values := range m {
+		reduced := reduceF(key, values)
+		arrReduced = append(arrReduced, KeyValue{key, reduced})
+	}
+
+	sort.Sort(byKey(arrReduced))
+
+	file, err := os.OpenFile(outFile, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer file.Close()
+
+	enc := json.NewEncoder(file)
+	for _, kvp := range arrReduced {
+		err := enc.Encode(kvp)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 }
