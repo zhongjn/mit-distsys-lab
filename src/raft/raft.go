@@ -206,6 +206,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.updateTerm(args.Term)
 
 	if args.Term < rf.currentTerm {
+		rf.persist()
+
+		// does not grant vote
 		*reply = RequestVoteReply{
 			Term:        rf.currentTerm,
 			VoteGranted: false,
@@ -214,6 +217,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
+		rf.votedFor = args.CandidateID
+		rf.persist()
+
 		// grant vote
 		*reply = RequestVoteReply{
 			Term:        rf.currentTerm,
@@ -285,15 +291,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.updateTerm(args.Term)
 
-	// reset election timer
-	if rf.role != roleFollower {
+	if args.Term < rf.currentTerm {
+		rf.persist()
+		*reply = AppendEntriesReply{
+			Success: false,
+			Term:    rf.currentTerm,
+		}
 		return
+	}
+
+	// NOTE:
+	// term must be equal from here
+
+	if rf.role == roleLeader {
+		panic("two leader in the same term!")
+	}
+
+	if rf.role == roleCandidate {
+		rf.role = roleFollower
+		DPrintf("#%d: converting to follower", rf.me)
 	}
 
 	rf.resetElectionTimer()
 	rf.lastLeaderMessageTime = time.Now()
 
 	// TODO: actual log appending
+
+	rf.persist()
+	*reply = AppendEntriesReply{
+		Success: true,
+		Term:    rf.currentTerm,
+	}
 }
 
 func (rf *Raft) doAllAppendEntries() {
@@ -352,7 +380,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) onElectionTimeout() {
 	rf.mu.AssertHeld()
-	DPrintf("#%d: election timeout", rf.me)
 
 	voteCount := 1 // vote for self
 
@@ -360,6 +387,8 @@ func (rf *Raft) onElectionTimeout() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.resetElectionTimer()
+
+	DPrintf("#%d: starting election, term=%d", rf.me, rf.currentTerm)
 
 	prevTerm := rf.currentTerm
 
@@ -454,9 +483,6 @@ func (rf *Raft) startElectionTimerWorker() {
 				rf.electionTimeValid = false
 				rf.onElectionTimeout()
 				rf.mu.Unlock()
-
-				var tt time.Timer
-				tt.Reset()
 			}
 		}
 	}()
