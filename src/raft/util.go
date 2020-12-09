@@ -6,7 +6,7 @@ import (
 )
 
 // Debugging
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -29,8 +29,8 @@ func (m *Mutex) Lock() {
 
 // Unlock the lock
 func (m *Mutex) Unlock() {
-	m.mu.Unlock()
 	m.held = false
+	m.mu.Unlock()
 }
 
 func (m *Mutex) AssertHeld() {

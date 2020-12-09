@@ -203,17 +203,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// current leader exists?
+	tLastLeader := time.Now().Sub(rf.lastLeaderMessageTime)
+	if tLastLeader < minElectionTimeout {
+		// no need to persist anything
+		// since currentTerm is not affected
+		goto notGrant
+	}
+
 	rf.updateTerm(args.Term)
 
 	if args.Term < rf.currentTerm {
 		rf.persist()
-
-		// does not grant vote
-		*reply = RequestVoteReply{
-			Term:        rf.currentTerm,
-			VoteGranted: false,
-		}
-		return
+		goto notGrant
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
@@ -225,6 +227,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			Term:        rf.currentTerm,
 			VoteGranted: true,
 		}
+		return
+	}
+
+notGrant:
+	*reply = RequestVoteReply{
+		Term:        rf.currentTerm,
+		VoteGranted: false,
 	}
 }
 
@@ -312,6 +321,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("#%d: converting to follower", rf.me)
 	}
 
+	DPrintf("#%d: reset election timer, leader=%d", rf.me, args.LeaderID)
 	rf.resetElectionTimer()
 	rf.lastLeaderMessageTime = time.Now()
 
@@ -396,11 +406,17 @@ func (rf *Raft) onElectionTimeout() {
 		if i != rf.me {
 			go func(i int) {
 				rf.mu.Lock()
-				iLastLog := len(rf.log) - 1
+
+				lastLogIndex := len(rf.log) - 1
+				lastLogTerm := 0
+				if lastLogIndex >= 0 {
+					lastLogTerm = rf.log[lastLogIndex].Term
+				}
+
 				args := RequestVoteArgs{
 					CandidateID:  rf.me,
-					LastLogTerm:  rf.log[iLastLog].Term,
-					LastLogIndex: iLastLog,
+					LastLogTerm:  lastLogTerm,
+					LastLogIndex: lastLogIndex,
 					Term:         rf.currentTerm,
 				}
 				var reply RequestVoteReply
@@ -436,7 +452,7 @@ func (rf *Raft) onElectionTimeout() {
 					DPrintf("$%d: won election, term=%d", rf.me, rf.currentTerm)
 					rf.role = roleLeader
 					rf.electionTimeValid = false // cancel election timer
-					rf.startElectionTimerWorker()
+					rf.startHeartbeatWorker()
 				}
 			}(i)
 		}
@@ -444,14 +460,17 @@ func (rf *Raft) onElectionTimeout() {
 }
 
 func (rf *Raft) startHeartbeatWorker() {
+	rf.mu.AssertHeld()
+	startTerm := rf.currentTerm
 	go func() {
 		for {
 			rf.mu.Lock()
-			if rf.killed || rf.role != roleLeader {
+			if rf.killed || rf.currentTerm != startTerm {
 				rf.mu.Unlock()
 				return
 			}
 
+			DPrintf("#%d: sending heartbeat", rf.me)
 			rf.doAllAppendEntries()
 
 			rf.mu.Unlock()
@@ -465,16 +484,16 @@ func (rf *Raft) startElectionTimerWorker() {
 		for {
 			rf.mu.Lock()
 
+			for !rf.electionTimeValid && !rf.killed {
+				rf.electionTimerEnable.Wait()
+			}
+
 			if rf.killed {
 				rf.mu.Unlock()
 				return
 			}
 
-			for !rf.electionTimeValid {
-				rf.electionTimerEnable.Wait()
-			}
-
-			sleep := time.Now().Sub(rf.electionTime)
+			sleep := rf.electionTime.Sub(time.Now())
 
 			if sleep > 0 {
 				rf.mu.Unlock()
@@ -535,7 +554,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.electionTimerEnable.Broadcast()
 	rf.killed = true
+	rf.mu.Unlock()
 }
 
 //
@@ -572,6 +594,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.startElectionTimerWorker()
+
+	rf.mu.Lock()
+	rf.resetElectionTimer()
+	rf.mu.Unlock()
 
 	return rf
 }
