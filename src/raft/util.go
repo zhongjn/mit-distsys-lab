@@ -38,3 +38,23 @@ func (m *Mutex) AssertHeld() {
 		panic("lock is not held")
 	}
 }
+
+func assert(cond bool, msg string) {
+	if !cond {
+		panic(msg)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
