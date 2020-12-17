@@ -1,13 +1,21 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"labrpc"
+	"log"
+	"math/big"
+	"time"
+	"util"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	mu            util.Mutex
+	currentLeader int
+	// TODO: unique id to de-duplicate
 }
 
 func nrand() int64 {
@@ -24,6 +32,23 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) getLeader() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	return ck.currentLeader
+}
+
+func (ck *Clerk) wrongLeader(previous int) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	if ck.currentLeader == previous {
+		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers)
+		log.Printf("Client: changing leader from %d to %d", previous, ck.currentLeader)
+	}
+}
+
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -37,9 +62,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	for {
+		leader := ck.getLeader()
+
+		args := GetArgs{Key: key}
+		var reply GetReply
+		ok := ck.servers[leader].Call("KVServer.Get", &args, &reply)
+
+		if ok {
+			if reply.WrongLeader {
+				ck.wrongLeader(leader)
+			} else if reply.Err != "" {
+				log.Printf("Get error: %s", reply.Err)
+			} else {
+				return reply.Value
+			}
+		}
+	}
 }
 
 //
@@ -54,6 +94,29 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	for {
+		leader := ck.getLeader()
+
+		args := PutAppendArgs{
+			Key:   key,
+			Value: value,
+			Op:    op,
+		}
+		var reply PutAppendReply
+		ok := ck.servers[leader].Call("KVServer.PutAppend", &args, &reply)
+
+		if ok {
+			if reply.WrongLeader {
+				ck.wrongLeader(leader)
+			} else if reply.Err != "" {
+				log.Printf("PutAppend error: %s", reply.Err)
+			} else {
+				break
+			}
+		}
+
+		time.Sleep(time.Millisecond * 100)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

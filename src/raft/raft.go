@@ -25,6 +25,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"util"
 )
 
 // import "bytes"
@@ -46,6 +47,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 type logEntry struct {
@@ -71,7 +73,7 @@ const (
 // Raft struct implementing a single Raft peer.
 //
 type Raft struct {
-	mu        Mutex               // Lock to protect shared access to this peer's state
+	mu        util.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -364,7 +366,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// NOTE:
 	// term must be equal from here
 
-	assert(rf.role != roleLeader, "two leader in the same term!")
+	util.Assert(rf.role != roleLeader, "two leader in the same term!")
 
 	if rf.role == roleCandidate {
 		rf.role = roleFollower
@@ -385,7 +387,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.PrevLogTerm != prevLogActualTerm {
 			conflictTerm = prevLogActualTerm
 			tBegin, _, ok := rf.findRangeOfTerm(prevLogActualTerm)
-			assert(ok, "term should be found")
+			util.Assert(ok, "term should be found")
 
 			conflictIndex = tBegin
 			goto notSuccess
@@ -396,7 +398,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// for existing entries (overlapping part of log & request)
 		// i is the index in AppendEntries request
-		conflictCheckLen := min(len(rf.log)-insertIndex, len(args.Entries))
+		conflictCheckLen := util.Min(len(rf.log)-insertIndex, len(args.Entries))
 		for i := 0; i < conflictCheckLen; i++ {
 			raftIndex := i + insertIndex
 			existingTerm := rf.log[raftIndex].Term
@@ -418,7 +420,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LearderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LearderCommit, len(rf.log)-1)
+		rf.commitIndex = util.Min(args.LearderCommit, len(rf.log)-1)
 		rf.notifyCommandApplied()
 	}
 
@@ -465,7 +467,7 @@ func (rf *Raft) findRangeOfTerm(term int) (begin, end int, ok bool) {
 
 func (rf *Raft) assertLeader() {
 	rf.mu.AssertHeld()
-	assert(rf.role == roleLeader, "not leader")
+	util.Assert(rf.role == roleLeader, "not leader")
 }
 
 // notify command is applied
@@ -480,6 +482,7 @@ func (rf *Raft) notifyCommandApplied() {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				CommandIndex: i,
+				CommandTerm:  rf.log[i].Term,
 				Command:      rf.log[i].Command,
 			}
 		}
@@ -573,9 +576,9 @@ func (rf *Raft) leaderBroadcastAppendEntries() {
 					// decrement next index
 					_, tEnd, ok := rf.findRangeOfTerm(reply.ConflictTerm)
 					if !ok {
-						rf.nextIndex[i] = max(reply.ConflictIndex, rf.matchIndex[i]+1)
+						rf.nextIndex[i] = util.Max(reply.ConflictIndex, rf.matchIndex[i]+1)
 					} else {
-						rf.nextIndex[i] = max(tEnd, rf.matchIndex[i]+1)
+						rf.nextIndex[i] = util.Max(tEnd, rf.matchIndex[i]+1)
 					}
 				}
 			}(i)
@@ -590,7 +593,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) candidateWonElection() {
 	rf.mu.AssertHeld()
-	assert(rf.role == roleCandidate, "not candidate")
+	util.Assert(rf.role == roleCandidate, "not candidate")
 
 	DPrintf("$%d: won election, term=%d", rf.me, rf.currentTerm)
 	rf.role = roleLeader
