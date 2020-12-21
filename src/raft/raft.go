@@ -44,11 +44,17 @@ import (
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
 	CommandTerm  int
+
+	SnapshotValid     bool
+	Snapshot          interface{}
+	SnapshotLastIndex int
+	SnapshotLastTerm  int
 }
 
 type logEntry struct {
@@ -93,6 +99,14 @@ type Raft struct {
 	log         []logEntry // physical log
 	logOffset   int        // offset between virtual log & physical (truncated) log
 
+	// snapshot
+	snapshotValid bool
+	snapshot      interface{}
+	// last log entry included by snapshot
+	// NOTE: snapshotLastIndex+1 >= logOffset
+	snapshotLastIndex int
+	snapshotLastTerm  int
+
 	// volatile state
 	role                  role
 	electionTime          time.Time
@@ -123,6 +137,16 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	return data
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -138,14 +162,50 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
+	rf.mu.AssertHeld()
+
 	// persist snapshot
+	data := rf.encodeState()
+	rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) persistWithSnapshot(term int, index int, snapshot interface{}) {
+	rf.mu.AssertHeld()
+
+	stateData := rf.encodeState()
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	e.Encode(term)
+	e.Encode(index)
+	e.Encode(snapshot)
+	snapshotData := w.Bytes()
+
+	rf.persister.SaveStateAndSnapshot(stateData, snapshotData)
+}
+
+func (rf *Raft) readSnapshot(snapshotData []byte) {
+	if snapshotData == nil || len(snapshotData) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshotData)
+	d := labgob.NewDecoder(r)
+
+	var term int
+	var index int
+	var snapshot interface{}
+	if d.Decode(&term) != nil ||
+		d.Decode(&index) != nil ||
+		d.Decode(&snapshot) != nil {
+
+		panic("read snapshot error")
+	}
+
+	rf.snapshotValid = true
+	rf.snapshot = snapshot
+	rf.snapshotLastTerm = term
+	rf.snapshotLastIndex = index
 }
 
 //
@@ -225,17 +285,17 @@ func (rf *Raft) logIndexV2P(virtual int) int {
 	return physical
 }
 
+func (rf *Raft) logIndexTryV2P(virtual int) (physical int, ok bool) {
+	rf.mu.AssertHeld()
+
+	physical = virtual - rf.logOffset
+	ok = physical >= 0
+	return
+}
+
 func (rf *Raft) logVirtualLength() int {
 	rf.mu.AssertHeld()
 	return len(rf.log) + rf.logOffset
-}
-
-func (rf *Raft) logTruncated(virtual int) bool {
-	rf.mu.AssertHeld()
-	if virtual < rf.logOffset {
-		return true
-	}
-	return false
 }
 
 // if term is higher, update currentTerm
@@ -243,7 +303,7 @@ func (rf *Raft) logTruncated(virtual int) bool {
 func (rf *Raft) updateTerm(term int) {
 	rf.mu.AssertHeld()
 	if term > rf.currentTerm {
-		DPrintf("#%d: updating term from %d to %d", rf.me, rf.currentTerm, term)
+		DPrintf("Raft #%d: updating term from %d to %d", rf.me, rf.currentTerm, term)
 		rf.currentTerm = term
 		rf.votedFor = -1
 		// if leader step down, restart election timer
@@ -287,7 +347,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	{
 		lastLogIndex := rf.logVirtualLength() - 1
 		lastLogTerm := rf.log[rf.logIndexV2P(lastLogIndex)].Term
-		DPrintf("#%d: self term[%d]=%d, candidate #%d with term[%d]=%d",
+		DPrintf("Raft #%d: self term[%d]=%d, candidate #%d with term[%d]=%d",
 			rf.me, lastLogIndex, lastLogTerm, args.CandidateID, args.LastLogIndex, args.LastLogTerm)
 
 		// is candidate at least up-to-date as self?
@@ -305,7 +365,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.persist()
 
 	// grant vote
-	DPrintf("#%d: vote granted to #%d", rf.me, args.CandidateID)
+	DPrintf("Raft #%d: vote granted to #%d", rf.me, args.CandidateID)
 	*reply = RequestVoteReply{
 		Term:        rf.currentTerm,
 		VoteGranted: true,
@@ -403,7 +463,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.role == roleCandidate {
 		rf.role = roleFollower
-		DPrintf("#%d: converting to follower", rf.me)
+		DPrintf("Raft #%d: converting to follower", rf.me)
 	}
 
 	rf.resetElectionTimer()
@@ -457,7 +517,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.notifyCommandApplied()
 	}
 
-	DPrintf("#%d: AppendEntries done, leader=%d, prevIndex=%d, len=%d, commitIndex=%d",
+	DPrintf("Raft #%d: AppendEntries done, leader=%d, prevIndex=%d, len=%d, commitIndex=%d",
 		rf.me, args.LeaderID, args.PrevLogIndex, len(args.Entries), rf.commitIndex)
 
 	// append entry succeeded
@@ -515,8 +575,27 @@ func (rf *Raft) startApplyWorker() {
 				close(rf.applyCh)
 				return
 			}
+
+			start := rf.lastApplied + 1 // inclusive
+			end := rf.commitIndex       // inclusive
 			var msgs []ApplyMsg
-			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+
+			// cannot be found in physical log
+			// install snapshot
+			if start < rf.logOffset {
+				util.Assert(rf.snapshotValid, "expect valid snapshot")
+				util.Assert(rf.snapshotLastIndex+1 >= rf.logOffset,
+					"expect no hole between physical log & snapshot")
+				msgs = append(msgs, ApplyMsg{
+					SnapshotValid:     true,
+					Snapshot:          rf.snapshot,
+					SnapshotLastIndex: rf.snapshotLastIndex,
+					SnapshotLastTerm:  rf.snapshotLastTerm,
+				})
+				start = rf.logOffset
+			}
+
+			for i := start; i <= end; i++ {
 				msgs = append(msgs, ApplyMsg{
 					CommandValid: true,
 					CommandIndex: i,
@@ -535,7 +614,7 @@ func (rf *Raft) startApplyWorker() {
 
 // notify command is applied
 func (rf *Raft) notifyCommandApplied() {
-	DPrintf("#%d: command applied, commitIndex=%d", rf.me, rf.commitIndex)
+	DPrintf("Raft #%d: command applied, commitIndex=%d", rf.me, rf.commitIndex)
 	rf.mu.AssertHeld()
 	rf.applyWorkerEnable.Broadcast()
 }
@@ -549,7 +628,7 @@ func (rf *Raft) leaderAdvanceCommitIndex() {
 	copy(followerIndexArr, rf.matchIndex)
 	// fix the matchIndex hole for leader itself
 	followerIndexArr[rf.me] = rf.logVirtualLength() - 1
-	DPrintf("#%d: all commit index %v", rf.me, followerIndexArr)
+	DPrintf("Raft #%d: all commit index %v", rf.me, followerIndexArr)
 
 	// sort in increasing order to check majority
 	sort.Ints(followerIndexArr)
@@ -607,7 +686,7 @@ func (rf *Raft) leaderBroadcastAppendEntries() {
 				}
 
 				if !ok {
-					// DPrintf("#%d: AppendEntries RPC to peer #%d failed", rf.me, i)
+					// DPrintf("Raft #%d: AppendEntries RPC to peer #%d failed", rf.me, i)
 					return
 				}
 
@@ -674,7 +753,7 @@ func (rf *Raft) onElectionTimeout() {
 	rf.resetElectionTimer()
 	rf.persist()
 
-	DPrintf("#%d: starting election, term=%d", rf.me, rf.currentTerm)
+	DPrintf("Raft #%d: starting election, term=%d", rf.me, rf.currentTerm)
 
 	prevTerm := rf.currentTerm
 
@@ -707,7 +786,7 @@ func (rf *Raft) onElectionTimeout() {
 				}
 
 				if !ok {
-					// DPrintf("#%d: RequestVote RPC to peer #%d failed", rf.me, i)
+					// DPrintf("Raft #%d: RequestVote RPC to peer #%d failed", rf.me, i)
 					return
 				}
 
@@ -728,7 +807,7 @@ func (rf *Raft) onElectionTimeout() {
 					return
 				}
 
-				DPrintf("#%d: received vote from #%d", rf.me, i)
+				DPrintf("Raft #%d: received vote from #%d", rf.me, i)
 
 				voteCount++
 				if voteCount > len(rf.peers)/2 {
@@ -750,7 +829,7 @@ func (rf *Raft) startHeartbeatWorker() {
 				return
 			}
 
-			DPrintf("#%d: sending heartbeat", rf.me)
+			DPrintf("Raft #%d: sending heartbeat", rf.me)
 			rf.leaderBroadcastAppendEntries()
 
 			rf.mu.Unlock()
@@ -810,7 +889,10 @@ func (rf *Raft) GetStateSize() int {
 // UpdateSnapshot method updates the snapshot in raft.
 // term & index refer to the last included log entry in the snapshot.
 func (rf *Raft) UpdateSnapshot(term int, index int, snapshot interface{}) {
-	// TODO: update snapshot
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.persistWithSnapshot(term, index, snapshot)
+	// TODO: truncate log
 }
 
 //
@@ -866,7 +948,7 @@ exit:
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-	DPrintf("#%d: killing", rf.me)
+	DPrintf("Raft #%d: killing", rf.me)
 
 	rf.mu.Lock()
 	rf.killed = true
@@ -898,6 +980,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	// invalid snapshot
+	rf.snapshotLastIndex = -1
+	rf.snapshotLastTerm = -1
+
 	rf.applyCh = applyCh
 	rf.applyWorkerEnable = sync.Cond{L: &rf.mu}
 
@@ -925,6 +1011,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.readSnapshot(persister.ReadSnapshot())
 
 	// NOTE:
 	// Raft struct is initialized

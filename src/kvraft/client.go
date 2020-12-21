@@ -3,7 +3,6 @@ package raftkv
 import (
 	"crypto/rand"
 	"labrpc"
-	"log"
 	"math/big"
 	"util"
 )
@@ -55,7 +54,7 @@ func (ck *Clerk) wrongLeader(previous int) {
 		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers)
 	}
 
-	log.Printf("Client: changing leader from %d to %d", previous, ck.currentLeader)
+	DPrintf("Client #%d: changing leader from %d to %d", ck.clientID%100, previous, ck.currentLeader)
 }
 
 //
@@ -82,14 +81,17 @@ func (ck *Clerk) Get(key string) string {
 			ClientID:  ck.clientID,
 			RequestID: reqID,
 		}
+
+		DPrintf("Client #%d: Get leader=%d, args=%+v", ck.clientID%100, leader, args)
 		var reply GetReply
 		ok := ck.servers[leader].Call("KVServer.Get", &args, &reply)
+		DPrintf("Client #%d: Get leader=%d, reply=%+v", ck.clientID%100, leader, reply)
 
 		if ok {
 			if reply.WrongLeader {
 				ck.wrongLeader(leader)
 			} else if reply.Err != "" {
-				log.Printf("Get error: %s", reply.Err)
+				DPrintf("Get error: %s", reply.Err)
 			} else {
 				return reply.Value
 			}
@@ -123,14 +125,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ClientID:  ck.clientID,
 			RequestID: reqID,
 		}
+
+		DPrintf("Client #%d: PutAppend leader=%d, args=%+v", ck.clientID%100, leader, args)
 		var reply PutAppendReply
 		ok := ck.servers[leader].Call("KVServer.PutAppend", &args, &reply)
+		DPrintf("Client #%d: PutAppend leader=%d, reply=%+v", ck.clientID%100, leader, reply)
 
 		if ok {
 			if reply.WrongLeader {
 				ck.wrongLeader(leader)
 			} else if reply.Err != "" {
-				log.Printf("PutAppend error: %s", reply.Err)
+				DPrintf("PutAppend error: %s", reply.Err)
 			} else {
 				break
 			}

@@ -9,17 +9,6 @@ import (
 	"util"
 )
 
-// Debug print?
-const Debug = 1
-
-// DPrintf prints debug information
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 // opEntry is a log entry in raft
 type opEntry struct {
 	// Your definitions here.
@@ -33,6 +22,8 @@ type opEntry struct {
 }
 
 type snapshot struct {
+	KvMap     map[string]string // key-value map
+	ClientACK map[int64]int64   // client ID -> the highest ACKed request ID
 }
 
 type commitCallbackInfo struct {
@@ -53,10 +44,11 @@ type KVServer struct {
 
 	killed         bool
 	killCh         chan struct{}                // channel signals kill
-	kvMap          map[string]string            // key-value map
 	commitCallback map[int][]commitCallbackInfo // commit index -> corresponding callback
+	kvMap          map[string]string            // key-value map
 	clientACK      map[int64]int64              // client ID -> the highest ACKed request ID
-	snapshotting   bool
+	term           int                          // raft term
+	index          int                          // raft index
 }
 
 // NOTE: callback is called AFTER op applied, with mutex held
@@ -69,11 +61,34 @@ func (kv *KVServer) registerCommitCallback(index, term int, callback func(bool))
 		})
 }
 
+// generate snapshot
+// deep copy current state
+func (kv *KVServer) generateSnapshot() snapshot {
+	kv.mu.AssertHeld()
+	snap := snapshot{
+		KvMap:     make(map[string]string),
+		ClientACK: make(map[int64]int64),
+	}
+	for k, v := range kv.kvMap {
+		snap.KvMap[k] = v
+	}
+	for k, v := range kv.clientACK {
+		snap.ClientACK[k] = v
+	}
+
+	return snap
+}
+
 func (kv *KVServer) checkShouldSnapshot() {
 	kv.mu.AssertHeld()
+	if kv.maxraftstate == -1 {
+		return
+	}
 	sz := kv.rf.GetStateSize()
 	if sz >= kv.maxraftstate {
 		// TODO: generate snapshot, call raft
+		snap := kv.generateSnapshot()
+		kv.rf.UpdateSnapshot(kv.term, kv.index, snap)
 	}
 }
 
@@ -90,8 +105,6 @@ func (kv *KVServer) raftExecute(op opEntry, commitCallback func()) (isleader boo
 		kv.mu.Unlock()
 		return false, false
 	}
-
-	kv.checkShouldSnapshot()
 
 	DPrintf("Server #%d: leader executing op %v", kv.me, op)
 
@@ -247,6 +260,8 @@ func (kv *KVServer) startApplyWorker() {
 				if msg.CommandValid {
 					kv.mu.Lock()
 					op := msg.Command.(opEntry)
+					kv.term = msg.CommandTerm
+					kv.index = msg.CommandIndex
 					// apply the message
 					wrongRequestID := kv.apply(op)
 					// execute commit callback if exist
@@ -256,6 +271,7 @@ func (kv *KVServer) startApplyWorker() {
 							cb.callback(cb.term == msg.CommandTerm && !wrongRequestID)
 						}
 					}
+					kv.checkShouldSnapshot()
 					kv.mu.Unlock()
 				} else {
 					// TODO: command not valid?

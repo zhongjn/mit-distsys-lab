@@ -73,7 +73,7 @@ func (cfg *config) cleanup() {
 	defer cfg.mu.Unlock()
 	for i := 0; i < len(cfg.kvservers); i++ {
 		if cfg.kvservers[i] != nil {
-			DPrintf("killing server %d", i)
+			DPrintf("Config: killing server %d", i)
 			cfg.kvservers[i].Kill()
 		}
 	}
@@ -108,7 +108,7 @@ func (cfg *config) SnapshotSize() int {
 // attach server i to servers listed in to
 // caller must hold cfg.mu
 func (cfg *config) connectUnlocked(i int, to []int) {
-	// log.Printf("connect peer %d to %v\n", i, to)
+	DPrintf("Config: connect peer %d to %v\n", i, to)
 
 	// outgoing socket files
 	for j := 0; j < len(to); j++ {
@@ -132,7 +132,7 @@ func (cfg *config) connect(i int, to []int) {
 // detach server i from the servers listed in from
 // caller must hold cfg.mu
 func (cfg *config) disconnectUnlocked(i int, from []int) {
-	// log.Printf("disconnect peer %d from %v\n", i, from)
+	DPrintf("Config: disconnect peer %d from %v\n", i, from)
 
 	// outgoing socket files
 	for j := 0; j < len(from); j++ {
@@ -177,7 +177,7 @@ func (cfg *config) ConnectAll() {
 func (cfg *config) partition(p1 []int, p2 []int) {
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
-	// log.Printf("partition servers into: %v %v\n", p1, p2)
+	DPrintf("Config: partition servers into: %v %v\n", p1, p2)
 	for i := 0; i < len(p1); i++ {
 		cfg.disconnectUnlocked(p1[i], p2)
 		cfg.connectUnlocked(p1[i], p1)
@@ -224,7 +224,7 @@ func (cfg *config) deleteClient(ck *Clerk) {
 
 // caller should hold cfg.mu
 func (cfg *config) ConnectClientUnlocked(ck *Clerk, to []int) {
-	// log.Printf("ConnectClient %v to %v\n", ck, to)
+	DPrintf("Config: ConnectClient %v to %v\n", ck, to)
 	endnames := cfg.clerks[ck]
 	for j := 0; j < len(to); j++ {
 		s := endnames[to[j]]
@@ -240,7 +240,7 @@ func (cfg *config) ConnectClient(ck *Clerk, to []int) {
 
 // caller should hold cfg.mu
 func (cfg *config) DisconnectClientUnlocked(ck *Clerk, from []int) {
-	// log.Printf("DisconnectClient %v from %v\n", ck, from)
+	DPrintf("Config: DisconnectClient %v from %v\n", ck, from)
 	endnames := cfg.clerks[ck]
 	for j := 0; j < len(from); j++ {
 		s := endnames[from[j]]
