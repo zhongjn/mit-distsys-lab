@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"labgob"
 	"labrpc"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -87,8 +88,9 @@ type Raft struct {
 
 	// persistent state
 	currentTerm int
-	votedFor    int // -1 if none
-	log         []logEntry
+	votedFor    int        // -1 if none
+	log         []logEntry // physical log
+	logOffset   int        // offset between virtual log & physical (truncated) log
 
 	// volatile state
 	role                  role
@@ -206,6 +208,27 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func (rf *Raft) logIndexP2V(physical int) int {
+	rf.mu.AssertHeld()
+	return physical + rf.logOffset
+}
+
+func (rf *Raft) logIndexV2P(virtual int) int {
+	rf.mu.AssertHeld()
+
+	physical := virtual - rf.logOffset
+	if physical < 0 || physical >= len(rf.log) {
+		log.Panicf("physical log index %d out of bound [0,%d)", physical, len(rf.log))
+	}
+
+	return physical
+}
+
+func (rf *Raft) logVirtualLength() int {
+	rf.mu.AssertHeld()
+	return len(rf.log) + rf.logOffset
+}
+
 // if term is higher, update currentTerm
 // rf.mu must be holding
 func (rf *Raft) updateTerm(term int) {
@@ -253,8 +276,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// election restriction
 	{
-		lastLogIndex := len(rf.log) - 1
-		lastLogTerm := rf.log[lastLogIndex].Term
+		lastLogIndex := rf.logVirtualLength() - 1
+		lastLogTerm := rf.log[rf.logIndexV2P(lastLogIndex)].Term
 		DPrintf("#%d: self term[%d]=%d, candidate #%d with term[%d]=%d",
 			rf.me, lastLogIndex, lastLogTerm, args.CandidateID, args.LastLogIndex, args.LastLogTerm)
 
@@ -376,13 +399,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.resetElectionTimer()
 	rf.lastLeaderMessageTime = time.Now()
 
-	if args.PrevLogIndex >= len(rf.log) {
-		conflictIndex = len(rf.log)
+	if args.PrevLogIndex >= rf.logVirtualLength() {
+		conflictIndex = rf.logVirtualLength()
 		goto notSuccess
 	}
 
 	{
-		prevLogActualTerm := rf.log[args.PrevLogIndex].Term
+		prevLogActualTerm := rf.log[rf.logIndexV2P(args.PrevLogIndex)].Term
 
 		if args.PrevLogTerm != prevLogActualTerm {
 			conflictTerm = prevLogActualTerm
@@ -398,29 +421,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// for existing entries (overlapping part of log & request)
 		// i is the index in AppendEntries request
-		conflictCheckLen := util.Min(len(rf.log)-insertIndex, len(args.Entries))
+		conflictCheckLen := util.Min(rf.logVirtualLength()-insertIndex, len(args.Entries))
 		for i := 0; i < conflictCheckLen; i++ {
 			raftIndex := i + insertIndex
-			existingTerm := rf.log[raftIndex].Term
+			existingTerm := rf.log[rf.logIndexV2P(raftIndex)].Term
 			curTerm := args.Entries[i].Term
 
 			// term conflict?
 			if curTerm != existingTerm {
 				// truncate log
-				rf.log = rf.log[0:raftIndex]
+				rf.log = rf.log[0:rf.logIndexV2P(raftIndex)]
 				break
 			}
 		}
 
 		// for entries that need actual append
 		// i is the index in AppendEntries request
-		for i := len(rf.log) - insertIndex; i < len(args.Entries); i++ {
+		for i := rf.logVirtualLength() - insertIndex; i < len(args.Entries); i++ {
 			rf.log = append(rf.log, args.Entries[i])
 		}
 	}
 
 	if args.LearderCommit > rf.commitIndex {
-		rf.commitIndex = util.Min(args.LearderCommit, len(rf.log)-1)
+		rf.commitIndex = util.Min(args.LearderCommit, rf.logVirtualLength()-1)
 		rf.notifyCommandApplied()
 	}
 
@@ -450,8 +473,8 @@ func (rf *Raft) findRangeOfTerm(term int) (begin, end int, ok bool) {
 			begin = i
 
 			var j int
-			for j = begin; j < len(rf.log); j++ {
-				if rf.log[j].Term != e.Term {
+			for j = begin; j < rf.logVirtualLength(); j++ {
+				if rf.log[rf.logIndexV2P(j)].Term != e.Term {
 					break
 				}
 			}
@@ -482,8 +505,8 @@ func (rf *Raft) notifyCommandApplied() {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				CommandIndex: i,
-				CommandTerm:  rf.log[i].Term,
-				Command:      rf.log[i].Command,
+				CommandTerm:  rf.log[rf.logIndexV2P(i)].Term,
+				Command:      rf.log[rf.logIndexV2P(i)].Command,
 			}
 		}
 		rf.lastApplied = rf.commitIndex
@@ -498,7 +521,7 @@ func (rf *Raft) leaderAdvanceCommitIndex() {
 	followerIndexArr := make([]int, len(rf.peers))
 	copy(followerIndexArr, rf.matchIndex)
 	// fix the matchIndex hole for leader itself
-	followerIndexArr[rf.me] = len(rf.log) - 1
+	followerIndexArr[rf.me] = rf.logVirtualLength() - 1
 	DPrintf("#%d: all commit index %v", rf.me, followerIndexArr)
 
 	// sort in increasing order to check majority
@@ -506,7 +529,7 @@ func (rf *Raft) leaderAdvanceCommitIndex() {
 	majorityIndex := followerIndexArr[len(rf.peers)/2]
 
 	if majorityIndex > rf.commitIndex &&
-		rf.log[majorityIndex].Term == rf.currentTerm {
+		rf.log[rf.logIndexV2P(majorityIndex)].Term == rf.currentTerm {
 
 		rf.commitIndex = majorityIndex
 		rf.notifyCommandApplied()
@@ -522,8 +545,8 @@ func (rf *Raft) leaderBroadcastAppendEntries() {
 		if i != rf.me {
 			go func(i int) {
 				rf.mu.Lock()
-				startIndex := rf.nextIndex[i] // inclusive
-				endIndex := len(rf.log)       // exclusive
+				startIndex := rf.nextIndex[i]     // inclusive
+				endIndex := rf.logVirtualLength() // exclusive
 
 				// update nextIndex eagerly
 				// because packet loss & reorder is relatively rare
@@ -533,8 +556,8 @@ func (rf *Raft) leaderBroadcastAppendEntries() {
 					Term:          rf.currentTerm,
 					LeaderID:      rf.me,
 					PrevLogIndex:  startIndex - 1,
-					PrevLogTerm:   rf.log[startIndex-1].Term,
-					Entries:       rf.log[startIndex:endIndex],
+					PrevLogTerm:   rf.log[rf.logIndexV2P(startIndex-1)].Term,
+					Entries:       rf.log[rf.logIndexV2P(startIndex):rf.logIndexV2P(endIndex)],
 					LearderCommit: rf.commitIndex,
 				}
 				var reply AppendEntriesReply
@@ -601,7 +624,7 @@ func (rf *Raft) candidateWonElection() {
 	rf.startHeartbeatWorker()
 
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.logVirtualLength()
 		rf.matchIndex[i] = 0
 	}
 }
@@ -626,8 +649,8 @@ func (rf *Raft) onElectionTimeout() {
 			go func(i int) {
 				rf.mu.Lock()
 
-				lastLogIndex := len(rf.log) - 1
-				lastLogTerm := rf.log[lastLogIndex].Term
+				lastLogIndex := rf.logVirtualLength() - 1
+				lastLogTerm := rf.log[rf.logIndexV2P(lastLogIndex)].Term
 
 				args := RequestVoteArgs{
 					CandidateID:  rf.me,
@@ -739,6 +762,19 @@ func (rf *Raft) resetElectionTimer() {
 	rf.electionTimerEnable.Broadcast()
 }
 
+// GetStateSize method gets the current persisted state (log) size.
+func (rf *Raft) GetStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.persister.RaftStateSize()
+}
+
+// UpdateSnapshot method updates the snapshot in raft.
+// term & index refer to the last included log entry in the snapshot.
+func (rf *Raft) UpdateSnapshot(term int, index int, snapshot interface{}) {
+	// TODO: update snapshot
+}
+
 //
 // Start the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -768,7 +804,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		goto exit
 	}
 
-	index = len(rf.log)
+	index = rf.logVirtualLength()
 	term = rf.currentTerm
 
 	rf.log = append(rf.log, logEntry{
@@ -833,6 +869,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.logOffset = 0
 	rf.log = make([]logEntry, 1)
 	rf.log[0] = logEntry{
 		Command: nil,
