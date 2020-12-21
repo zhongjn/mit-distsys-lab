@@ -5,7 +5,6 @@ import (
 	"labrpc"
 	"log"
 	"math/big"
-	"time"
 	"util"
 )
 
@@ -15,7 +14,8 @@ type Clerk struct {
 
 	mu            util.Mutex
 	currentLeader int
-	// TODO: unique id to de-duplicate
+	clientID      int64
+	requestID     int64
 }
 
 func nrand() int64 {
@@ -29,6 +29,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientID = nrand()
 	return ck
 }
 
@@ -39,14 +40,22 @@ func (ck *Clerk) getLeader() int {
 	return ck.currentLeader
 }
 
+func (ck *Clerk) getRequestID() int64 {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.requestID++
+	return ck.requestID
+}
+
 func (ck *Clerk) wrongLeader(previous int) {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 
 	if ck.currentLeader == previous {
 		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers)
-		log.Printf("Client: changing leader from %d to %d", previous, ck.currentLeader)
 	}
+
+	log.Printf("Client: changing leader from %d to %d", previous, ck.currentLeader)
 }
 
 //
@@ -62,11 +71,17 @@ func (ck *Clerk) wrongLeader(previous int) {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	reqID := ck.getRequestID()
+
 	// You will have to modify this function.
 	for {
 		leader := ck.getLeader()
 
-		args := GetArgs{Key: key}
+		args := GetArgs{
+			Key:       key,
+			ClientID:  ck.clientID,
+			RequestID: reqID,
+		}
 		var reply GetReply
 		ok := ck.servers[leader].Call("KVServer.Get", &args, &reply)
 
@@ -78,6 +93,8 @@ func (ck *Clerk) Get(key string) string {
 			} else {
 				return reply.Value
 			}
+		} else {
+			ck.wrongLeader(leader)
 		}
 	}
 }
@@ -93,14 +110,18 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	reqID := ck.getRequestID()
+
 	// You will have to modify this function.
 	for {
 		leader := ck.getLeader()
 
 		args := PutAppendArgs{
-			Key:   key,
-			Value: value,
-			Op:    op,
+			Key:       key,
+			Value:     value,
+			Op:        op,
+			ClientID:  ck.clientID,
+			RequestID: reqID,
 		}
 		var reply PutAppendReply
 		ok := ck.servers[leader].Call("KVServer.PutAppend", &args, &reply)
@@ -113,9 +134,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			} else {
 				break
 			}
+		} else {
+			ck.wrongLeader(leader)
 		}
-
-		time.Sleep(time.Millisecond * 100)
 	}
 }
 

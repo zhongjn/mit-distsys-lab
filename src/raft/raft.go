@@ -792,6 +792,8 @@ exit:
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	DPrintf("#%d: killing", rf.me)
+
 	rf.mu.Lock()
 	rf.electionTimerEnable.Broadcast()
 	rf.killed = true

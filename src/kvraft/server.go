@@ -5,6 +5,7 @@ import (
 	"labrpc"
 	"log"
 	"raft"
+	"time"
 	"util"
 )
 
@@ -24,9 +25,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op    string // Put, Append, Get
-	Key   string
-	Value string
+	Op        string // Put, Append, Get
+	Key       string
+	Value     string
+	ClientID  int64
+	RequestID int64
 }
 
 type commitCallbackInfo struct {
@@ -46,9 +49,10 @@ type KVServer struct {
 	// Your definitions here.
 
 	killed         bool
-	killCh         chan struct{}     // channel signals kill
-	kvMap          map[string]string // key-value map
-	commitCallback map[int][]commitCallbackInfo
+	killCh         chan struct{}                // channel signals kill
+	kvMap          map[string]string            // key-value map
+	commitCallback map[int][]commitCallbackInfo // commit index -> corresponding callback
+	clientACK      map[int64]int64              // client ID -> the highest ACKed request ID
 }
 
 // NOTE: callback is called AFTER op applied, with mutex held
@@ -69,18 +73,21 @@ func (kv *KVServer) raftExecute(op Op, commitCallback func()) (isleader bool, co
 		return false, false
 	}
 
+	kv.mu.Unlock()
+
 	index, term, isleader := kv.rf.Start(op)
 	if !isleader {
-		kv.mu.Unlock()
 		return false, false
 	}
 
+	kv.mu.Lock()
 	DPrintf("Server #%d: leader executing op %v", kv.me, op)
 
+	timeout := false
 	ch := make(chan struct{})
 	kv.registerCommitCallback(index, term, func(success bool) {
 		kv.mu.AssertHeld()
-		if success {
+		if success && !timeout {
 			if commitCallback != nil {
 				commitCallback()
 			}
@@ -91,8 +98,17 @@ func (kv *KVServer) raftExecute(op Op, commitCallback func()) (isleader bool, co
 	})
 
 	kv.mu.Unlock()
-	_, ok := <-ch
-	return true, ok
+
+	select {
+	case _, ok := <-ch:
+		return true, ok
+	case <-time.After(200 * time.Millisecond):
+		kv.mu.Lock()
+		timeout = true
+		kv.mu.Unlock()
+
+		return false, false
+	}
 }
 
 // Get RPC call
@@ -101,7 +117,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// DPrintf("Server #%d: Get %s", kv.me, args.Key)
 
 	var value string
-	isleader, committed := kv.raftExecute(Op{Op: "Read"},
+	isleader, committed := kv.raftExecute(
+		Op{
+			Op:        "Read",
+			ClientID:  args.ClientID,
+			RequestID: args.RequestID,
+		},
 		func() {
 			value = kv.kvMap[args.Key]
 		})
@@ -131,9 +152,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// DPrintf("Server #%d: %s %s %s", kv.me, args.Op, args.Key, args.Value)
 
 	isleader, committed := kv.raftExecute(Op{
-		Op:    args.Op,
-		Key:   args.Key,
-		Value: args.Value,
+		Op:        args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientID:  args.ClientID,
+		RequestID: args.RequestID,
 	}, nil)
 
 	if !isleader {
@@ -166,8 +189,20 @@ func (kv *KVServer) Kill() {
 	kv.mu.Unlock()
 }
 
-func (kv *KVServer) apply(op Op) {
+func (kv *KVServer) apply(op Op) (wrongRequestID bool) {
 	kv.mu.AssertHeld()
+
+	ack := kv.clientACK[op.ClientID]
+	if ack >= op.RequestID {
+		return false
+	}
+
+	if ack+1 != op.RequestID {
+		return true
+	}
+
+	kv.clientACK[op.ClientID] = op.RequestID
+
 	switch op.Op {
 	case "Read":
 		break
@@ -180,6 +215,8 @@ func (kv *KVServer) apply(op Op) {
 	default:
 		log.Panicf("not supported op %s", op.Op)
 	}
+
+	return false
 }
 
 func (kv *KVServer) startApplyWorker() {
@@ -200,13 +237,12 @@ func (kv *KVServer) startApplyWorker() {
 					kv.mu.Lock()
 					op := msg.Command.(Op)
 					// apply the message
-					kv.apply(op)
+					wrongRequestID := kv.apply(op)
 					// execute commit callback if exist
-					cbs, ok := kv.commitCallback[msg.CommandIndex]
-					if ok {
+					if cbs, ok := kv.commitCallback[msg.CommandIndex]; ok {
 						delete(kv.commitCallback, msg.CommandIndex)
 						for _, cb := range cbs {
-							cb.callback(cb.term == msg.CommandTerm)
+							cb.callback(cb.term == msg.CommandTerm && !wrongRequestID)
 						}
 					}
 					kv.mu.Unlock()
@@ -253,6 +289,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.killCh = make(chan struct{})
 	kv.kvMap = make(map[string]string)
 	kv.commitCallback = make(map[int][]commitCallbackInfo)
+	kv.clientACK = make(map[int64]int64)
 	kv.startApplyWorker()
 
 	return kv
