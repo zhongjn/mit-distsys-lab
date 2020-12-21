@@ -20,16 +20,19 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-// Op is a log entry in raft
-type Op struct {
+// opEntry is a log entry in raft
+type opEntry struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op        string // Put, Append, Get
+	Type      string // Put, Append, Get
 	Key       string
 	Value     string
 	ClientID  int64
 	RequestID int64
+}
+
+type snapshot struct {
 }
 
 type commitCallbackInfo struct {
@@ -53,6 +56,7 @@ type KVServer struct {
 	kvMap          map[string]string            // key-value map
 	commitCallback map[int][]commitCallbackInfo // commit index -> corresponding callback
 	clientACK      map[int64]int64              // client ID -> the highest ACKed request ID
+	snapshotting   bool
 }
 
 // NOTE: callback is called AFTER op applied, with mutex held
@@ -65,7 +69,15 @@ func (kv *KVServer) registerCommitCallback(index, term int, callback func(bool))
 		})
 }
 
-func (kv *KVServer) raftExecute(op Op, commitCallback func()) (isleader bool, committed bool) {
+func (kv *KVServer) checkShouldSnapshot() {
+	kv.mu.AssertHeld()
+	sz := kv.rf.GetStateSize()
+	if sz >= kv.maxraftstate {
+		// TODO: generate snapshot, call raft
+	}
+}
+
+func (kv *KVServer) raftExecute(op opEntry, commitCallback func()) (isleader bool, committed bool) {
 	kv.mu.Lock()
 
 	if kv.killed {
@@ -73,14 +85,14 @@ func (kv *KVServer) raftExecute(op Op, commitCallback func()) (isleader bool, co
 		return false, false
 	}
 
-	kv.mu.Unlock()
-
 	index, term, isleader := kv.rf.Start(op)
 	if !isleader {
+		kv.mu.Unlock()
 		return false, false
 	}
 
-	kv.mu.Lock()
+	kv.checkShouldSnapshot()
+
 	DPrintf("Server #%d: leader executing op %v", kv.me, op)
 
 	timeout := false
@@ -118,8 +130,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	var value string
 	isleader, committed := kv.raftExecute(
-		Op{
-			Op:        "Read",
+		opEntry{
+			Type:      "Read",
 			ClientID:  args.ClientID,
 			RequestID: args.RequestID,
 		},
@@ -151,8 +163,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// DPrintf("Server #%d: %s %s %s", kv.me, args.Op, args.Key, args.Value)
 
-	isleader, committed := kv.raftExecute(Op{
-		Op:        args.Op,
+	isleader, committed := kv.raftExecute(opEntry{
+		Type:      args.Op,
 		Key:       args.Key,
 		Value:     args.Value,
 		ClientID:  args.ClientID,
@@ -179,17 +191,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *KVServer) Kill() {
-	kv.rf.Kill()
-
-	// Your code here, if desired.
 	kv.killCh <- struct{}{}
 
 	kv.mu.Lock()
 	kv.killed = true
 	kv.mu.Unlock()
+
+	kv.rf.Kill()
 }
 
-func (kv *KVServer) apply(op Op) (wrongRequestID bool) {
+func (kv *KVServer) apply(op opEntry) (wrongRequestID bool) {
 	kv.mu.AssertHeld()
 
 	ack := kv.clientACK[op.ClientID]
@@ -203,7 +214,7 @@ func (kv *KVServer) apply(op Op) (wrongRequestID bool) {
 
 	kv.clientACK[op.ClientID] = op.RequestID
 
-	switch op.Op {
+	switch op.Type {
 	case "Read":
 		break
 	case "Put":
@@ -213,7 +224,7 @@ func (kv *KVServer) apply(op Op) (wrongRequestID bool) {
 		kv.kvMap[op.Key] += op.Value
 		break
 	default:
-		log.Panicf("not supported op %s", op.Op)
+		log.Panicf("not supported op %s", op.Type)
 	}
 
 	return false
@@ -235,7 +246,7 @@ func (kv *KVServer) startApplyWorker() {
 			case msg := <-kv.applyCh:
 				if msg.CommandValid {
 					kv.mu.Lock()
-					op := msg.Command.(Op)
+					op := msg.Command.(opEntry)
 					// apply the message
 					wrongRequestID := kv.apply(op)
 					// execute commit callback if exist
@@ -272,7 +283,7 @@ func (kv *KVServer) startApplyWorker() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(opEntry{})
 
 	kv := new(KVServer)
 	kv.me = me

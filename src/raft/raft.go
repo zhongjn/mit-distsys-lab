@@ -512,6 +512,7 @@ func (rf *Raft) startApplyWorker() {
 			}
 			if rf.killed {
 				rf.mu.Unlock()
+				close(rf.applyCh)
 				return
 			}
 			var msgs []ApplyMsg
@@ -571,6 +572,11 @@ func (rf *Raft) leaderBroadcastAppendEntries() {
 		if i != rf.me {
 			go func(i int) {
 				rf.mu.Lock()
+				if rf.currentTerm != prevTerm {
+					rf.mu.Unlock()
+					return
+				}
+
 				// TODO: check startIndex is truncated
 				// If so, send InstallSnapshot RPC instead
 				startIndex := rf.nextIndex[i]     // inclusive
@@ -676,6 +682,10 @@ func (rf *Raft) onElectionTimeout() {
 		if i != rf.me {
 			go func(i int) {
 				rf.mu.Lock()
+				if rf.currentTerm != prevTerm {
+					rf.mu.Unlock()
+					return
+				}
 
 				lastLogIndex := rf.logVirtualLength() - 1
 				lastLogTerm := rf.log[rf.logIndexV2P(lastLogIndex)].Term
@@ -859,9 +869,13 @@ func (rf *Raft) Kill() {
 	DPrintf("#%d: killing", rf.me)
 
 	rf.mu.Lock()
-	rf.electionTimerEnable.Broadcast()
 	rf.killed = true
+	rf.electionTimerEnable.Broadcast()
+	rf.applyWorkerEnable.Broadcast()
 	rf.mu.Unlock()
+
+	for range rf.applyCh {
+	}
 }
 
 //
