@@ -66,8 +66,8 @@ const (
 
 const (
 	heartbeatPeriod    time.Duration = 125 * time.Millisecond
-	minElectionTimeout time.Duration = 500 * time.Millisecond
-	maxElectionTimeout time.Duration = 1000 * time.Millisecond
+	minElectionTimeout time.Duration = 300 * time.Millisecond
+	maxElectionTimeout time.Duration = 500 * time.Millisecond
 )
 
 //
@@ -83,8 +83,9 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	applyCh chan ApplyMsg
-	killed  bool
+	applyCh           chan ApplyMsg
+	applyWorkerEnable sync.Cond
+	killed            bool
 
 	// persistent state
 	currentTerm int
@@ -217,8 +218,8 @@ func (rf *Raft) logIndexV2P(virtual int) int {
 	rf.mu.AssertHeld()
 
 	physical := virtual - rf.logOffset
-	if physical < 0 || physical >= len(rf.log) {
-		log.Panicf("physical log index %d out of bound [0,%d)", physical, len(rf.log))
+	if physical < 0 {
+		log.Panicf("negative physical log index %d", physical)
 	}
 
 	return physical
@@ -227,6 +228,14 @@ func (rf *Raft) logIndexV2P(virtual int) int {
 func (rf *Raft) logVirtualLength() int {
 	rf.mu.AssertHeld()
 	return len(rf.log) + rf.logOffset
+}
+
+func (rf *Raft) logTruncated(virtual int) bool {
+	rf.mu.AssertHeld()
+	if virtual < rf.logOffset {
+		return true
+	}
+	return false
 }
 
 // if term is higher, update currentTerm
@@ -291,6 +300,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
+	rf.resetElectionTimer()
 	rf.votedFor = args.CandidateID
 	rf.persist()
 
@@ -493,24 +503,40 @@ func (rf *Raft) assertLeader() {
 	util.Assert(rf.role == roleLeader, "not leader")
 }
 
+func (rf *Raft) startApplyWorker() {
+	go func() {
+		for {
+			rf.mu.Lock()
+			for rf.lastApplied == rf.commitIndex && !rf.killed {
+				rf.applyWorkerEnable.Wait()
+			}
+			if rf.killed {
+				rf.mu.Unlock()
+				return
+			}
+			var msgs []ApplyMsg
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				msgs = append(msgs, ApplyMsg{
+					CommandValid: true,
+					CommandIndex: i,
+					CommandTerm:  rf.log[rf.logIndexV2P(i)].Term,
+					Command:      rf.log[rf.logIndexV2P(i)].Command,
+				})
+			}
+			rf.mu.Unlock()
+
+			for _, msg := range msgs {
+				rf.applyCh <- msg
+			}
+		}
+	}()
+}
+
 // notify command is applied
 func (rf *Raft) notifyCommandApplied() {
 	DPrintf("#%d: command applied, commitIndex=%d", rf.me, rf.commitIndex)
-
-	go func() {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				CommandIndex: i,
-				CommandTerm:  rf.log[rf.logIndexV2P(i)].Term,
-				Command:      rf.log[rf.logIndexV2P(i)].Command,
-			}
-		}
-		rf.lastApplied = rf.commitIndex
-	}()
+	rf.mu.AssertHeld()
+	rf.applyWorkerEnable.Broadcast()
 }
 
 // advance commit index based on follower's matchIndex
@@ -545,6 +571,8 @@ func (rf *Raft) leaderBroadcastAppendEntries() {
 		if i != rf.me {
 			go func(i int) {
 				rf.mu.Lock()
+				// TODO: check startIndex is truncated
+				// If so, send InstallSnapshot RPC instead
 				startIndex := rf.nextIndex[i]     // inclusive
 				endIndex := rf.logVirtualLength() // exclusive
 
@@ -855,9 +883,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.applyCh = applyCh
 
-	// Your initialization code here (2A, 2B, 2C).
+	rf.applyCh = applyCh
+	rf.applyWorkerEnable = sync.Cond{L: &rf.mu}
+
 	rf.role = roleFollower
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -888,6 +917,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Need mutex to protect access from now on
 
 	rf.startElectionTimerWorker()
+	rf.startApplyWorker()
 
 	rf.mu.Lock()
 	rf.resetElectionTimer()
