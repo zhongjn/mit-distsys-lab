@@ -5,6 +5,7 @@ import (
 	"labrpc"
 	"log"
 	"raft"
+	"sync/atomic"
 	"time"
 	"util"
 )
@@ -22,7 +23,7 @@ type opEntry struct {
 }
 
 type snapshot struct {
-	KvMap     map[string]string // key-value map
+	KVMap     map[string]string // key-value map
 	ClientACK map[int64]int64   // client ID -> the highest ACKed request ID
 }
 
@@ -61,21 +62,30 @@ func (kv *KVServer) registerCommitCallback(index, term int, callback func(bool))
 		})
 }
 
+func cloneMapStringString(m map[string]string) map[string]string {
+	r := make(map[string]string)
+	for k, v := range m {
+		r[k] = v
+	}
+	return r
+}
+
+func cloneMapInt64Int64(m map[int64]int64) map[int64]int64 {
+	r := make(map[int64]int64)
+	for k, v := range m {
+		r[k] = v
+	}
+	return r
+}
+
 // generate snapshot
 // deep copy current state
 func (kv *KVServer) generateSnapshot() snapshot {
 	kv.mu.AssertHeld()
 	snap := snapshot{
-		KvMap:     make(map[string]string),
-		ClientACK: make(map[int64]int64),
+		KVMap:     cloneMapStringString(kv.kvMap),
+		ClientACK: cloneMapInt64Int64(kv.clientACK),
 	}
-	for k, v := range kv.kvMap {
-		snap.KvMap[k] = v
-	}
-	for k, v := range kv.clientACK {
-		snap.ClientACK[k] = v
-	}
-
 	return snap
 }
 
@@ -86,8 +96,9 @@ func (kv *KVServer) checkShouldSnapshot() {
 	}
 	sz := kv.rf.GetStateSize()
 	if sz >= kv.maxraftstate {
-		// TODO: generate snapshot, call raft
+		// generate snapshot, call raft
 		snap := kv.generateSnapshot()
+		// log.Printf("Server #%d: snap ack=%v", kv.me, snap.ClientACK)
 		kv.rf.UpdateSnapshot(kv.term, kv.index, snap)
 	}
 }
@@ -108,16 +119,25 @@ func (kv *KVServer) raftExecute(op opEntry, commitCallback func()) (isleader boo
 
 	DPrintf("Server #%d: leader executing op %v", kv.me, op)
 
-	timeout := false
-	ch := make(chan struct{})
+	// flag is used to eliminate race condition
+	// between callback & timeout. whoever captured
+	// the flag is allowed to progress
+	flag := int32(0)
+
+	// channel used to notify completion
+	ch := make(chan struct{}, 1)
+
 	kv.registerCommitCallback(index, term, func(success bool) {
 		kv.mu.AssertHeld()
-		if success && !timeout {
+		if success && atomic.CompareAndSwapInt32(&flag, 0, 1) {
+			// commit succeeded and flag captured, execute callback
 			if commitCallback != nil {
 				commitCallback()
 			}
 			ch <- struct{}{}
 		} else {
+			// commit failed or flag not captured
+			// close channel to notify failure
 			close(ch)
 		}
 	})
@@ -128,11 +148,13 @@ func (kv *KVServer) raftExecute(op opEntry, commitCallback func()) (isleader boo
 	case _, ok := <-ch:
 		return true, ok
 	case <-time.After(200 * time.Millisecond):
-		kv.mu.Lock()
-		timeout = true
-		kv.mu.Unlock()
-
-		return false, false
+		if atomic.CompareAndSwapInt32(&flag, 0, 1) {
+			// flag captured, actual timeout
+			return false, false
+		}
+		// flag not captured, callback succeeded
+		_, ok := <-ch
+		return true, ok
 	}
 }
 
@@ -243,6 +265,13 @@ func (kv *KVServer) apply(op opEntry) (wrongRequestID bool) {
 	return false
 }
 
+func (kv *KVServer) applySnapshot(snap snapshot) {
+	kv.mu.AssertHeld()
+	// clone might not be needed
+	kv.kvMap = cloneMapStringString(snap.KVMap)
+	kv.clientACK = cloneMapInt64Int64(snap.ClientACK)
+}
+
 func (kv *KVServer) startApplyWorker() {
 	go func() {
 		for {
@@ -260,6 +289,8 @@ func (kv *KVServer) startApplyWorker() {
 				if msg.CommandValid {
 					kv.mu.Lock()
 					op := msg.Command.(opEntry)
+					DPrintf("Server #%d: applying command, term=%d, index=%d, cmdTerm=%d, cmdIndex=%d",
+						kv.me, kv.term, kv.index, msg.CommandTerm, msg.CommandIndex)
 					kv.term = msg.CommandTerm
 					kv.index = msg.CommandIndex
 					// apply the message
@@ -272,6 +303,23 @@ func (kv *KVServer) startApplyWorker() {
 						}
 					}
 					kv.checkShouldSnapshot()
+					kv.mu.Unlock()
+				} else if msg.SnapshotValid {
+					kv.mu.Lock()
+					DPrintf("Server #%d: applying snapshot, term=%d, index=%d, snapTerm=%d, snapIndex=%d",
+						kv.me, kv.term, kv.index, msg.SnapshotLastTerm, msg.SnapshotLastIndex)
+					util.Assert(msg.SnapshotLastTerm >= kv.term &&
+						msg.SnapshotLastIndex >= kv.index, "term & index should be monotonic")
+					prevIndex := kv.index
+					kv.term, kv.index = msg.SnapshotLastTerm, msg.SnapshotLastIndex
+					// remove previous callback (avoid memory leak)
+					for i := prevIndex; i <= kv.index; i++ {
+						delete(kv.commitCallback, i)
+					}
+					// apply snapshot
+					snap := msg.Snapshot.(snapshot)
+					// log.Printf("Server #%d: snap ack=%v", kv.me, snap.ClientACK)
+					kv.applySnapshot(snap)
 					kv.mu.Unlock()
 				} else {
 					// TODO: command not valid?
@@ -300,6 +348,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(opEntry{})
+	labgob.Register(snapshot{})
 
 	kv := new(KVServer)
 	kv.me = me

@@ -142,6 +142,7 @@ func (rf *Raft) encodeState() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.logOffset)
 	e.Encode(rf.log)
 	data := w.Bytes()
 	return data
@@ -178,7 +179,7 @@ func (rf *Raft) persistWithSnapshot(term int, index int, snapshot interface{}) {
 	e := labgob.NewEncoder(w)
 	e.Encode(term)
 	e.Encode(index)
-	e.Encode(snapshot)
+	e.Encode(&snapshot)
 	snapshotData := w.Bytes()
 
 	rf.persister.SaveStateAndSnapshot(stateData, snapshotData)
@@ -206,6 +207,10 @@ func (rf *Raft) readSnapshot(snapshotData []byte) {
 	rf.snapshot = snapshot
 	rf.snapshotLastTerm = term
 	rf.snapshotLastIndex = index
+
+	rf.commitIndex = rf.snapshotLastIndex
+
+	// log.Printf("Raft #%d: read snapshot, term=%d, index=%d", rf.me, term, index)
 }
 
 //
@@ -233,10 +238,12 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var logOffset int
 	var log []logEntry
 
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&logOffset) != nil ||
 		d.Decode(&log) != nil {
 
 		panic("read persist error")
@@ -244,6 +251,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
+	rf.logOffset = logOffset
 	rf.log = log
 }
 
@@ -283,14 +291,6 @@ func (rf *Raft) logIndexV2P(virtual int) int {
 	}
 
 	return physical
-}
-
-func (rf *Raft) logIndexTryV2P(virtual int) (physical int, ok bool) {
-	rf.mu.AssertHeld()
-
-	physical = virtual - rf.logOffset
-	ok = physical >= 0
-	return
 }
 
 func (rf *Raft) logVirtualLength() int {
@@ -346,7 +346,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// election restriction
 	{
 		lastLogIndex := rf.logVirtualLength() - 1
-		lastLogTerm := rf.log[rf.logIndexV2P(lastLogIndex)].Term
+		var lastLogTerm int
+		if term, ok := rf.getLogTerm(lastLogIndex); ok {
+			lastLogTerm = term
+		} else {
+			log.Panic("expect ok")
+		}
 		DPrintf("Raft #%d: self term[%d]=%d, candidate #%d with term[%d]=%d",
 			rf.me, lastLogIndex, lastLogTerm, args.CandidateID, args.LastLogIndex, args.LastLogTerm)
 
@@ -475,13 +480,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	{
-		prevLogActualTerm := rf.log[rf.logIndexV2P(args.PrevLogIndex)].Term
+		var prevLogActualTerm int
+		if term, ok := rf.getLogTerm(args.PrevLogIndex); ok {
+			prevLogActualTerm = term
+		} else {
+			goto notSuccess
+		}
 
 		if args.PrevLogTerm != prevLogActualTerm {
 			conflictTerm = prevLogActualTerm
-			tBegin, _, ok := rf.findRangeOfTerm(prevLogActualTerm)
-			util.Assert(ok, "term should be found")
-
+			tBegin, _, _ := rf.findRangeOfTerm(prevLogActualTerm)
+			// ok is discarded here since the term might be part
+			// of snapshot, thus range is not found, tBegin would
+			// be -1.
 			conflictIndex = tBegin
 			goto notSuccess
 		}
@@ -533,14 +544,148 @@ notSuccess:
 	}
 }
 
+//
+// InstallSnapshotArgs RPC structure
+//
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+//
+// InstallSnapshotReply RPC structure
+//
+type InstallSnapshotReply struct {
+	Term int
+}
+
+// InstallSnapshot RPC handler
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	// TODO: install snapshot
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.updateTerm(args.Term)
+
+	if args.Term < rf.currentTerm {
+		goto exit
+	}
+
+	// NOTE:
+	// term must be equal from here
+
+	util.Assert(rf.role != roleLeader, "two leader in the same term!")
+
+	if rf.role == roleCandidate {
+		rf.role = roleFollower
+		DPrintf("Raft #%d: converting to follower", rf.me)
+	}
+
+	rf.resetElectionTimer()
+	rf.lastLeaderMessageTime = time.Now()
+
+	util.Assert(args.Done && args.Offset == 0, "chunk not supported yet")
+	if args.LastIncludedIndex <= rf.commitIndex {
+		goto exit
+	}
+
+	{
+		r := bytes.NewBuffer(args.Data)
+		d := labgob.NewDecoder(r)
+
+		var snapshot interface{}
+		if err := d.Decode(&snapshot); err != nil {
+			log.Panicf("Raft #%d: decode snapshot error: %v", rf.me, err)
+		}
+
+		rf.updateSnapshotInternal(args.LastIncludedTerm, args.LastIncludedIndex, snapshot)
+		rf.commitIndex = args.LastIncludedIndex
+		rf.notifyCommandApplied()
+	}
+
+	DPrintf("Raft #%d: InstallSnapshot done, leader=%d, lastTerm=%d, lastIndex=%d",
+		rf.me, args.LeaderID, args.LastIncludedTerm, args.LastIncludedIndex)
+
+exit:
+	rf.persist()
+	*reply = InstallSnapshotReply{
+		Term: rf.currentTerm,
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) leaderSendInstallSnapshot(server int, prevTerm int) {
+	rf.mu.AssertHeld()
+	rf.assertLeader()
+
+	rf.persist()
+
+	util.Assert(rf.snapshotValid, "snapshot should be valid")
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(&rf.snapshot); err != nil {
+		log.Panicf("encode error")
+	}
+	data := w.Bytes()
+
+	lastIndex := rf.snapshotLastIndex
+
+	// TODO: more data trunks
+	args := InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderID:          rf.me,
+		LastIncludedIndex: rf.snapshotLastIndex,
+		LastIncludedTerm:  rf.snapshotLastTerm,
+		Data:              data,
+		Offset:            0,
+		Done:              true,
+	}
+
+	var reply InstallSnapshotReply
+	rf.mu.Unlock()
+	ok := rf.sendInstallSnapshot(server, &args, &reply)
+
+	rf.mu.Lock()
+
+	if rf.killed {
+		return
+	}
+
+	if !ok {
+		return
+	}
+
+	rf.updateTerm(reply.Term)
+
+	if rf.currentTerm != prevTerm {
+		return
+	}
+
+	rf.nextIndex[server] = lastIndex + 1
+}
+
 // NOTE: begin is inclusive, end is exclusive
+// if term <= snapshot last included term, return false
 func (rf *Raft) findRangeOfTerm(term int) (begin, end int, ok bool) {
 	rf.mu.AssertHeld()
+
+	if rf.snapshotValid && term <= rf.snapshotLastTerm {
+		return -1, -1, false
+	}
 
 	// TODO: faster (e.g. binary search)
 	for i, e := range rf.log {
 		if e.Term == term {
-			begin = i
+			begin = rf.logIndexP2V(i)
 
 			var j int
 			for j = begin; j < rf.logVirtualLength(); j++ {
@@ -580,6 +725,8 @@ func (rf *Raft) startApplyWorker() {
 			end := rf.commitIndex       // inclusive
 			var msgs []ApplyMsg
 
+			DPrintf("Raft #%d: applying [%d,%d]", rf.me, start, end)
+
 			// cannot be found in physical log
 			// install snapshot
 			if start < rf.logOffset {
@@ -603,11 +750,15 @@ func (rf *Raft) startApplyWorker() {
 					Command:      rf.log[rf.logIndexV2P(i)].Command,
 				})
 			}
+
+			rf.lastApplied = rf.commitIndex
 			rf.mu.Unlock()
 
 			for _, msg := range msgs {
 				rf.applyCh <- msg
 			}
+
+			DPrintf("Raft #%d: apply sent [%d,%d]", rf.me, start, end)
 		}
 	}()
 }
@@ -642,7 +793,92 @@ func (rf *Raft) leaderAdvanceCommitIndex() {
 	}
 }
 
-func (rf *Raft) leaderBroadcastAppendEntries() {
+// NOTE: because of log compaction, this might fail
+func (rf *Raft) getLogTerm(index int) (term int, ok bool) {
+	rf.mu.AssertHeld()
+	if rf.snapshotValid && index == rf.snapshotLastIndex {
+		return rf.snapshotLastTerm, true
+	} else if index >= rf.logOffset {
+		return rf.log[rf.logIndexV2P(index)].Term, true
+	} else {
+		return -1, false
+	}
+}
+
+func (rf *Raft) leaderSendAppendEntries(server int, prevTerm int) {
+	rf.mu.AssertHeld()
+	rf.assertLeader()
+
+	startIndex := rf.nextIndex[server] // inclusive
+	endIndex := rf.logVirtualLength()  // exclusive
+
+	util.Assert(startIndex >= rf.logOffset, "physical log already truncated. use InstallSnapshot.")
+
+	// update nextIndex eagerly
+	// because packet loss & reorder is relatively rare
+	rf.nextIndex[server] = endIndex
+
+	var prevLogTerm int
+	if term, ok := rf.getLogTerm(startIndex - 1); ok {
+		prevLogTerm = term
+	} else {
+		log.Panic("expect ok")
+	}
+
+	args := AppendEntriesArgs{
+		Term:          rf.currentTerm,
+		LeaderID:      rf.me,
+		PrevLogIndex:  startIndex - 1,
+		PrevLogTerm:   prevLogTerm,
+		Entries:       rf.log[rf.logIndexV2P(startIndex):rf.logIndexV2P(endIndex)],
+		LearderCommit: rf.commitIndex,
+	}
+	var reply AppendEntriesReply
+	rf.mu.Unlock()
+
+	ok := rf.sendAppendEntries(server, &args, &reply)
+
+	rf.mu.Lock()
+
+	if rf.killed {
+		return
+	}
+
+	if !ok {
+		// DPrintf("Raft #%d: AppendEntries RPC to peer #%d failed", rf.me, i)
+		return
+	}
+
+	rf.updateTerm(reply.Term)
+
+	if rf.currentTerm != prevTerm {
+		return
+	}
+
+	// NOTE:
+	// since the term equals, we are still the leader
+
+	if reply.Success {
+		// check match index monotonicity
+		// discard old packet
+		if endIndex-1 > rf.matchIndex[server] {
+			// increment next index & match index
+			rf.matchIndex[server] = endIndex - 1
+			rf.nextIndex[server] = endIndex
+			rf.leaderAdvanceCommitIndex()
+		}
+	} else {
+		// decrement next index
+		_, tEnd, ok := rf.findRangeOfTerm(reply.ConflictTerm)
+		if !ok {
+			rf.nextIndex[server] = util.Max(reply.ConflictIndex, rf.matchIndex[server]+1)
+		} else {
+			rf.nextIndex[server] = util.Max(tEnd, rf.matchIndex[server]+1)
+		}
+	}
+}
+
+func (rf *Raft) leaderBroadcast() {
 	rf.mu.AssertHeld()
 	rf.assertLeader()
 	prevTerm := rf.currentTerm
@@ -656,67 +892,16 @@ func (rf *Raft) leaderBroadcastAppendEntries() {
 					return
 				}
 
-				// TODO: check startIndex is truncated
-				// If so, send InstallSnapshot RPC instead
-				startIndex := rf.nextIndex[i]     // inclusive
-				endIndex := rf.logVirtualLength() // exclusive
-
-				// update nextIndex eagerly
-				// because packet loss & reorder is relatively rare
-				rf.nextIndex[i] = endIndex
-
-				args := AppendEntriesArgs{
-					Term:          rf.currentTerm,
-					LeaderID:      rf.me,
-					PrevLogIndex:  startIndex - 1,
-					PrevLogTerm:   rf.log[rf.logIndexV2P(startIndex-1)].Term,
-					Entries:       rf.log[rf.logIndexV2P(startIndex):rf.logIndexV2P(endIndex)],
-					LearderCommit: rf.commitIndex,
-				}
-				var reply AppendEntriesReply
-				rf.mu.Unlock()
-
-				ok := rf.sendAppendEntries(i, &args, &reply)
-
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-
-				if rf.killed {
-					return
-				}
-
-				if !ok {
-					// DPrintf("Raft #%d: AppendEntries RPC to peer #%d failed", rf.me, i)
-					return
-				}
-
-				rf.updateTerm(reply.Term)
-
-				if rf.currentTerm != prevTerm {
-					return
-				}
-
-				// NOTE:
-				// since the term equals, we are still the leader
-
-				if reply.Success {
-					// check match index monotonicity
-					// discard old packet
-					if endIndex-1 > rf.matchIndex[i] {
-						// increment next index & match index
-						rf.matchIndex[i] = endIndex - 1
-						rf.nextIndex[i] = endIndex
-						rf.leaderAdvanceCommitIndex()
-					}
+				// check startIndex is truncated
+				// if so, send InstallSnapshot RPC instead
+				startIndex := rf.nextIndex[i] // inclusive
+				if startIndex >= rf.logOffset {
+					rf.leaderSendAppendEntries(i, prevTerm)
 				} else {
-					// decrement next index
-					_, tEnd, ok := rf.findRangeOfTerm(reply.ConflictTerm)
-					if !ok {
-						rf.nextIndex[i] = util.Max(reply.ConflictIndex, rf.matchIndex[i]+1)
-					} else {
-						rf.nextIndex[i] = util.Max(tEnd, rf.matchIndex[i]+1)
-					}
+					rf.leaderSendInstallSnapshot(i, prevTerm)
 				}
+
+				rf.mu.Unlock()
 			}(i)
 		}
 	}
@@ -767,7 +952,12 @@ func (rf *Raft) onElectionTimeout() {
 				}
 
 				lastLogIndex := rf.logVirtualLength() - 1
-				lastLogTerm := rf.log[rf.logIndexV2P(lastLogIndex)].Term
+				var lastLogTerm int
+				if term, ok := rf.getLogTerm(lastLogIndex); ok {
+					lastLogTerm = term
+				} else {
+					log.Panic("expect ok")
+				}
 
 				args := RequestVoteArgs{
 					CandidateID:  rf.me,
@@ -830,7 +1020,7 @@ func (rf *Raft) startHeartbeatWorker() {
 			}
 
 			DPrintf("Raft #%d: sending heartbeat", rf.me)
-			rf.leaderBroadcastAppendEntries()
+			rf.leaderBroadcast()
 
 			rf.mu.Unlock()
 			time.Sleep(heartbeatPeriod)
@@ -886,13 +1076,37 @@ func (rf *Raft) GetStateSize() int {
 	return rf.persister.RaftStateSize()
 }
 
+func (rf *Raft) updateSnapshotInternal(term int, index int, snapshot interface{}) {
+	rf.mu.AssertHeld()
+
+	if rf.snapshotValid && index < rf.snapshotLastIndex {
+		return
+	}
+
+	rf.persistWithSnapshot(term, index, snapshot)
+	rf.snapshotValid = true
+	rf.snapshotLastTerm = term
+	rf.snapshotLastIndex = index
+	rf.snapshot = snapshot
+	// log.Printf("Raft #%d: update snapshot, term=%d, index=%d", rf.me, term, index)
+
+	prevLogOffset := rf.logOffset
+	rf.logOffset = index + 1
+
+	logStart := rf.logOffset - prevLogOffset
+	if logStart <= len(rf.log) {
+		rf.log = rf.log[logStart:len(rf.log)]
+	} else {
+		rf.log = nil
+	}
+}
+
 // UpdateSnapshot method updates the snapshot in raft.
 // term & index refer to the last included log entry in the snapshot.
 func (rf *Raft) UpdateSnapshot(term int, index int, snapshot interface{}) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.persistWithSnapshot(term, index, snapshot)
-	// TODO: truncate log
+	rf.updateSnapshotInternal(term, index, snapshot)
 }
 
 //
@@ -932,7 +1146,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 	})
 	rf.persist()
-	rf.leaderBroadcastAppendEntries()
+	rf.leaderBroadcast()
 
 exit:
 	return index, term, isLeader
@@ -958,6 +1172,8 @@ func (rf *Raft) Kill() {
 
 	for range rf.applyCh {
 	}
+
+	DPrintf("Raft #%d: killed", rf.me)
 }
 
 //

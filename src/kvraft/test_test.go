@@ -241,9 +241,10 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 		}
 
 		if crash {
-			DPrintf("Tester: shutdown servers\n")
+			DPrintf("Tester: shutdown %d servers\n", nservers)
 			for i := 0; i < nservers; i++ {
 				cfg.ShutdownServer(i)
+				DPrintf("Tester: shutdown %d done", i)
 			}
 			// Wait for a while for servers to shutdown, since
 			// shutdown isn't a real crash and isn't instantaneous

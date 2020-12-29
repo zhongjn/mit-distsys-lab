@@ -3,7 +3,7 @@ package raftkv
 import "log"
 
 // Debug print?
-const Debug = 1
+const Debug = 0
 
 // DPrintf prints debug information
 func DPrintf(format string, a ...interface{}) (n int, err error) {
