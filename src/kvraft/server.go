@@ -98,7 +98,6 @@ func (kv *KVServer) checkShouldSnapshot() {
 	if sz >= kv.maxraftstate {
 		// generate snapshot, call raft
 		snap := kv.generateSnapshot()
-		// log.Printf("Server #%d: snap ack=%v", kv.me, snap.ClientACK)
 		kv.rf.UpdateSnapshot(kv.term, kv.index, snap)
 	}
 }
