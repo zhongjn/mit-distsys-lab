@@ -12,10 +12,13 @@ type commitCallbackInfo struct {
 }
 
 // ApplyFunc is the apply function pointer
-type ApplyFunc func(state interface{}, op interface{}) (newState interface{}, result interface{})
+type ApplyFunc func(oldState interface{}, op interface{}) (newState interface{}, result interface{})
 
 // SnapshotFunc is the snapshot function pointer
 type SnapshotFunc func(state interface{}) (snapshot interface{})
+
+// RecoverFunc is the recover function pointer
+type RecoverFunc func(snapshot interface{}) (state interface{})
 
 // Helper is the wrapper around raft algorithm
 type Helper struct {
@@ -34,6 +37,7 @@ type Helper struct {
 
 	applyFn    ApplyFunc
 	snapshotFn SnapshotFunc
+	recoverFn  RecoverFunc
 }
 
 // NOTE: callback is called AFTER op applied, with mutex held
@@ -130,13 +134,14 @@ func (rh *Helper) startApplyWorker() {
 				if msg.CommandValid {
 					rh.mu.Lock()
 					op := msg.Command
-					DPrintf("Raft.Helper #%d: applying command, term=%d, index=%d, cmdTerm=%d, cmdIndex=%d",
-						rh.me, rh.term, rh.index, msg.CommandTerm, msg.CommandIndex)
+					DPrintf("Raft.Helper #%d: applying command %v, term=%d, index=%d, cmdTerm=%d, cmdIndex=%d",
+						rh.me, op, rh.term, rh.index, msg.CommandTerm, msg.CommandIndex)
 					rh.term = msg.CommandTerm
 					rh.index = msg.CommandIndex
 					// apply the message
 					newState, result := rh.applyFn(rh.state, op)
 					rh.state = newState
+					DPrintf("Raft.Helper #%d: state %+v", rh.me, rh.state)
 					// execute commit callback if exist
 					if cbs, ok := rh.commitCallback[msg.CommandIndex]; ok {
 						delete(rh.commitCallback, msg.CommandIndex)
@@ -158,7 +163,7 @@ func (rh *Helper) startApplyWorker() {
 					for i := prevIndex; i <= rh.index; i++ {
 						delete(rh.commitCallback, i)
 					}
-					rh.state = msg.Snapshot
+					rh.state = rh.recoverFn(msg.Snapshot)
 					rh.mu.Unlock()
 				} else {
 					// TODO: command not valid?
@@ -184,13 +189,14 @@ func (rh *Helper) Kill() {
 func MakeHelper(
 	rf *Raft, rfApplyCh chan ApplyMsg, me int,
 	maxLogSize int, defaultState interface{},
-	applyFn ApplyFunc, snapshotFn SnapshotFunc) *Helper {
+	applyFn ApplyFunc, snapshotFn SnapshotFunc, recoverFn RecoverFunc) *Helper {
 
 	rh := &Helper{
 		me:             me,
 		rf:             rf,
 		applyFn:        applyFn,
 		snapshotFn:     snapshotFn,
+		recoverFn:      recoverFn,
 		maxLogSize:     maxLogSize,
 		state:          defaultState,
 		commitCallback: make(map[int][]commitCallbackInfo),
